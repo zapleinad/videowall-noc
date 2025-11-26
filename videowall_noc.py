@@ -3,6 +3,7 @@
 """
 Sistema de Gerenciamento de Video Wall - SALA NOC
 Ministerio da Justica e Seguranca Publica
+Versao com suporte a RTSP e Crop Visual
 """
 
 import tkinter as tk
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 import os
 from datetime import datetime
 import sys
+import urllib.request
+import urllib.error
 
 if sys.platform == 'win32':
     try:
@@ -57,10 +60,20 @@ class Encoder:
     name: str
     ip: str
     port: int = 5000
+    rtsp_port: int = 554
+    rtsp_port_preview: int = 2554
     description: str = ""
     status: str = "offline"
     width: int = 1920
     height: int = 1080
+    
+    def get_rtsp_url(self, resolution="1080"):
+        if resolution == "4k":
+            return f"rtsp://{self.ip}:551/2160"
+        elif resolution == "preview":
+            return f"rtsp://{self.ip}:2554/352"
+        else:
+            return f"rtsp://{self.ip}:554/1080"
     
     def to_dict(self):
         return asdict(self)
@@ -76,6 +89,7 @@ class Decoder:
     name: str
     ip: str
     port: int = 5000
+    http_port: int = 80
     position: Tuple[int, int] = (0, 0)
     current_source: Optional[str] = None
     status: str = "offline"
@@ -142,36 +156,155 @@ class Preset:
 
 
 class AVCITController:
+    """Controlador de comunicacao com dispositivos AVCIT"""
+    
     def __init__(self, timeout: float = 2.0):
         self.timeout = timeout
+        self.command_log = []
     
-    def send_command(self, ip: str, port: int, command: str):
+    def log_command(self, target_ip, command, success, response=None):
+        """Log de comandos para debug"""
+        self.command_log.append({
+            'timestamp': datetime.now().isoformat(),
+            'target': target_ip,
+            'command': command,
+            'success': success,
+            'response': response
+        })
+        if len(self.command_log) > 100:
+            self.command_log.pop(0)
+    
+    def send_tcp_command(self, ip: str, port: int, command: str):
+        """Envia comando via TCP"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.timeout)
                 sock.connect((ip, port))
                 sock.sendall(command.encode('utf-8'))
                 response = sock.recv(4096).decode('utf-8')
+                self.log_command(ip, command, True, response)
                 return response
-        except Exception:
+        except Exception as e:
+            self.log_command(ip, command, False, str(e))
             return None
     
+    def send_http_command(self, ip: str, port: int, endpoint: str, params: dict = None):
+        """Envia comando via HTTP REST API"""
+        try:
+            url = f"http://{ip}:{port}{endpoint}"
+            if params:
+                param_str = "&".join([f"{k}={v}" for k, v in params.items()])
+                url = f"{url}?{param_str}"
+            
+            req = urllib.request.Request(url, method='GET')
+            req.add_header('User-Agent', 'VideoWall-NOC/1.0')
+            
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                result = response.read().decode('utf-8')
+                self.log_command(ip, f"HTTP:{endpoint}", True, result)
+                return result
+        except Exception as e:
+            self.log_command(ip, f"HTTP:{endpoint}", False, str(e))
+            return None
+    
+    def switch_source_tcp(self, decoder_ip, decoder_port, encoder_ip, encoder_port):
+        """Troca fonte via TCP - Protocolo AVCIT padrao"""
+        # Tenta varios formatos de comando conhecidos
+        commands = [
+            f"SWITCH:{encoder_ip}:{encoder_port}\r\n",
+            f"switch {encoder_ip} {encoder_port}\r\n",
+            f"SET SOURCE {encoder_ip}\r\n",
+            f"ROUTE {encoder_ip} TO {decoder_ip}\r\n",
+        ]
+        
+        for cmd in commands:
+            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
+            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
+                return True
+        return False
+    
+    def switch_source_http(self, decoder_ip, http_port, encoder_ip):
+        """Troca fonte via HTTP API"""
+        # Tenta varios endpoints conhecidos de dispositivos AVCIT
+        endpoints = [
+            ("/api/switch", {"source": encoder_ip}),
+            ("/cgi-bin/switch.cgi", {"ip": encoder_ip}),
+            ("/control/switch", {"encoder": encoder_ip}),
+            ("/api/v1/source", {"address": encoder_ip}),
+        ]
+        
+        for endpoint, params in endpoints:
+            response = self.send_http_command(decoder_ip, http_port, endpoint, params)
+            if response and ("ok" in response.lower() or "success" in response.lower()):
+                return True
+        return False
+    
     def switch_source(self, decoder_ip, decoder_port, encoder_ip, encoder_port):
-        command = f"SWITCH:{encoder_ip}:{encoder_port}\r\n"
-        response = self.send_command(decoder_ip, decoder_port, command)
-        return response is not None and "OK" in str(response).upper()
+        """Tenta trocar fonte usando TCP e HTTP"""
+        # Primeiro tenta TCP
+        if self.switch_source_tcp(decoder_ip, decoder_port, encoder_ip, encoder_port):
+            return True
+        # Se falhar, tenta HTTP
+        return self.switch_source_http(decoder_ip, 80, encoder_ip)
+    
+    def set_crop_tcp(self, decoder_ip, decoder_port, crop):
+        """Configura crop via TCP"""
+        commands = [
+            f"CROP:{crop.x}:{crop.y}:{crop.width}:{crop.height}\r\n",
+            f"SET CROP {crop.x} {crop.y} {crop.width} {crop.height}\r\n",
+            f"WINDOW {crop.x},{crop.y},{crop.width},{crop.height}\r\n",
+        ]
+        
+        for cmd in commands:
+            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
+            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
+                return True
+        return False
+    
+    def set_crop_http(self, decoder_ip, http_port, crop):
+        """Configura crop via HTTP API"""
+        params = {
+            "x": crop.x,
+            "y": crop.y,
+            "width": crop.width,
+            "height": crop.height
+        }
+        
+        endpoints = [
+            "/api/crop",
+            "/cgi-bin/crop.cgi",
+            "/control/window",
+            "/api/v1/crop",
+        ]
+        
+        for endpoint in endpoints:
+            response = self.send_http_command(decoder_ip, http_port, endpoint, params)
+            if response and ("ok" in response.lower() or "success" in response.lower()):
+                return True
+        return False
     
     def set_crop(self, decoder_ip, decoder_port, crop):
-        command = f"CROP:{crop.x}:{crop.y}:{crop.width}:{crop.height}:{crop.source_width}:{crop.source_height}\r\n"
-        response = self.send_command(decoder_ip, decoder_port, command)
-        return response is not None and "OK" in str(response).upper()
+        """Tenta configurar crop usando TCP e HTTP"""
+        if self.set_crop_tcp(decoder_ip, decoder_port, crop):
+            return True
+        return self.set_crop_http(decoder_ip, 80, crop)
     
     def clear_crop(self, decoder_ip, decoder_port):
-        command = "CROP:CLEAR\r\n"
-        response = self.send_command(decoder_ip, decoder_port, command)
-        return response is not None and "OK" in str(response).upper()
+        """Limpa configuracao de crop"""
+        commands = [
+            "CROP:CLEAR\r\n",
+            "CROP:0:0:1920:1080\r\n",
+            "SET CROP FULL\r\n",
+        ]
+        
+        for cmd in commands:
+            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
+            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
+                return True
+        return False
     
     def ping_device(self, ip, port):
+        """Verifica se dispositivo esta online"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1.0)
@@ -179,9 +312,30 @@ class AVCITController:
                 return result == 0
         except Exception:
             return False
+    
+    def ping_http(self, ip, port=80):
+        """Verifica se dispositivo responde HTTP"""
+        try:
+            url = f"http://{ip}:{port}/"
+            req = urllib.request.Request(url, method='HEAD')
+            with urllib.request.urlopen(req, timeout=1.0) as response:
+                return response.status < 500
+        except:
+            return False
+    
+    def check_device_status(self, ip, tcp_port=5000, http_port=80):
+        """Verifica status do dispositivo via TCP e HTTP"""
+        tcp_ok = self.ping_device(ip, tcp_port)
+        http_ok = self.ping_http(ip, http_port)
+        
+        if tcp_ok or http_ok:
+            return "online"
+        return "offline"
 
 
 class CropSelectorDialog(tk.Toplevel):
+    """Dialogo para selecao interativa de regiao de recorte"""
+    
     def __init__(self, parent, encoder, current_crop, callback):
         super().__init__(parent)
         self.encoder = encoder
@@ -189,7 +343,7 @@ class CropSelectorDialog(tk.Toplevel):
         self.current_crop = current_crop
         
         self.title(f"Configurar Recorte - {encoder.name}")
-        self.geometry("900x700")
+        self.geometry("900x750")
         self.configure(bg='#2d2d2d')
         self.resizable(True, True)
         self.transient(parent)
@@ -212,12 +366,21 @@ class CropSelectorDialog(tk.Toplevel):
         main_frame = tk.Frame(self, bg='#2d2d2d')
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
-        tk.Label(main_frame, text=f"Fonte: {self.encoder.name} ({self.source_width}x{self.source_height})",
-                 bg='#2d2d2d', fg='white', font=('Segoe UI', 12, 'bold')).pack(pady=5)
+        # Info da fonte
+        info_frame = tk.Frame(main_frame, bg='#2d2d2d')
+        info_frame.pack(fill='x', pady=5)
+        
+        tk.Label(info_frame, text=f"Fonte: {self.encoder.name}", 
+                 bg='#2d2d2d', fg='white', font=('Segoe UI', 12, 'bold')).pack(side='left', padx=5)
+        tk.Label(info_frame, text=f"IP: {self.encoder.ip}", 
+                 bg='#2d2d2d', fg='#4a9eff', font=('Segoe UI', 10)).pack(side='left', padx=10)
+        tk.Label(info_frame, text=f"Resolucao: {self.source_width}x{self.source_height}", 
+                 bg='#2d2d2d', fg='#888888', font=('Segoe UI', 10)).pack(side='left', padx=10)
         
         tk.Label(main_frame, text="Clique e arraste para selecionar a regiao de recorte",
                  bg='#2d2d2d', fg='#888888', font=('Segoe UI', 10)).pack(pady=2)
         
+        # Canvas para selecao visual
         canvas_frame = tk.Frame(main_frame, bg='#1a1a2e', relief='solid', bd=2)
         canvas_frame.pack(pady=10)
         
@@ -232,6 +395,7 @@ class CropSelectorDialog(tk.Toplevel):
         self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_mouse_up)
         
+        # Controles numericos
         controls_frame = tk.Frame(main_frame, bg='#2d2d2d')
         controls_frame.pack(fill='x', pady=10)
         
@@ -256,6 +420,7 @@ class CropSelectorDialog(tk.Toplevel):
         
         ttk.Button(input_frame, text="Aplicar Valores", command=self.update_selection_from_values).grid(row=0, column=8, padx=10)
         
+        # Presets de recorte
         presets_frame = tk.LabelFrame(controls_frame, text="Presets de Recorte", bg='#2d2d2d', fg='white')
         presets_frame.pack(fill='x', pady=10, padx=20)
         
@@ -268,15 +433,18 @@ class CropSelectorDialog(tk.Toplevel):
             ("Quadrante Inf.Esq.", self.preset_bottom_left), ("Quadrante Inf.Dir.", self.preset_bottom_right),
             ("Metade Esquerda", self.preset_left_half), ("Metade Direita", self.preset_right_half),
             ("Metade Superior", self.preset_top_half), ("Metade Inferior", self.preset_bottom_half),
+            ("Terco Central", self.preset_center_third), ("16:9 Central", self.preset_16_9_center),
         ]
         
         for i, (text, command) in enumerate(preset_buttons):
-            ttk.Button(presets_inner, text=text, command=command, width=16).grid(row=i//5, column=i%5, padx=3, pady=3)
+            ttk.Button(presets_inner, text=text, command=command, width=16).grid(row=i//4, column=i%4, padx=3, pady=3)
         
+        # Info da selecao
         self.info_label = tk.Label(main_frame, text="Nenhuma regiao selecionada",
                                    bg='#2d2d2d', fg='#4a9eff', font=('Segoe UI', 10))
         self.info_label.pack(pady=5)
         
+        # Botoes de acao
         btn_frame = tk.Frame(main_frame, bg='#2d2d2d')
         btn_frame.pack(pady=10)
         
@@ -285,17 +453,24 @@ class CropSelectorDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Cancelar", command=self.destroy).pack(side='left', padx=5)
     
     def draw_grid(self):
+        # Grade de referencia
         for i in range(1, 4):
             x = i * self.display_width // 4
             self.canvas.create_line(x, 0, x, self.display_height, fill='#333333', dash=(2, 4))
         for i in range(1, 4):
             y = i * self.display_height // 4
             self.canvas.create_line(0, y, self.display_width, y, fill='#333333', dash=(2, 4))
+        
+        # Linhas centrais
+        cx = self.display_width // 2
+        self.canvas.create_line(cx, 0, cx, self.display_height, fill='#444444', width=1)
+        cy = self.display_height // 2
+        self.canvas.create_line(0, cy, self.display_width, cy, fill='#444444', width=1)
     
     def draw_source_representation(self):
         self.canvas.create_rectangle(2, 2, self.display_width - 2, self.display_height - 2, outline='#4a9eff', width=2)
         self.canvas.create_text(self.display_width // 2, self.display_height // 2,
-                                text=f"{self.encoder.name}\n{self.source_width}x{self.source_height}",
+                                text=f"{self.encoder.name}\n{self.source_width}x{self.source_height}\n{self.encoder.ip}",
                                 fill='#666666', font=('Segoe UI', 14), justify='center')
     
     def load_existing_crop(self, crop):
@@ -347,7 +522,7 @@ class CropSelectorDialog(tk.Toplevel):
         self.w_var.set(str(real_w))
         self.h_var.set(str(real_h))
         percentage = (real_w * real_h) / (self.source_width * self.source_height) * 100
-        self.info_label.configure(text=f"Regiao: ({real_x}, {real_y}) - {real_w}x{real_h} pixels ({percentage:.1f}%)")
+        self.info_label.configure(text=f"Regiao: ({real_x}, {real_y}) - {real_w}x{real_h} pixels ({percentage:.1f}% da fonte)")
     
     def update_selection_from_values(self):
         try:
@@ -360,7 +535,7 @@ class CropSelectorDialog(tk.Toplevel):
             self.draw_source_representation()
             self.current_rect_id = self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline='#00ff00', width=3)
             percentage = (w * h) / (self.source_width * self.source_height) * 100
-            self.info_label.configure(text=f"Regiao: ({x}, {y}) - {w}x{h} pixels ({percentage:.1f}%)")
+            self.info_label.configure(text=f"Regiao: ({x}, {y}) - {w}x{h} pixels ({percentage:.1f}% da fonte)")
         except ValueError:
             pass
     
@@ -402,6 +577,20 @@ class CropSelectorDialog(tk.Toplevel):
     def preset_bottom_half(self):
         self.set_crop_values(0, self.source_height // 2, self.source_width, self.source_height // 2)
     
+    def preset_center_third(self):
+        w, h = self.source_width // 3, self.source_height // 3
+        self.set_crop_values((self.source_width - w) // 2, (self.source_height - h) // 2, w, h)
+    
+    def preset_16_9_center(self):
+        target_ratio = 16 / 9
+        if self.source_width / self.source_height > target_ratio:
+            h = self.source_height
+            w = int(h * target_ratio)
+        else:
+            w = self.source_width
+            h = int(w / target_ratio)
+        self.set_crop_values((self.source_width - w) // 2, (self.source_height - h) // 2, w, h)
+    
     def apply_crop(self):
         try:
             crop = CropRegion(
@@ -423,6 +612,57 @@ class CropSelectorDialog(tk.Toplevel):
     def clear_crop(self):
         self.callback(None)
         self.destroy()
+
+
+class CommandLogDialog(tk.Toplevel):
+    """Dialogo para visualizar log de comandos"""
+    
+    def __init__(self, parent, avcit_controller):
+        super().__init__(parent)
+        self.avcit = avcit_controller
+        
+        self.title("Log de Comandos AVCIT")
+        self.geometry("800x500")
+        self.configure(bg='#2d2d2d')
+        self.transient(parent)
+        
+        # Text area com scroll
+        text_frame = tk.Frame(self, bg='#2d2d2d')
+        text_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side='right', fill='y')
+        
+        self.text = tk.Text(text_frame, bg='#1a1a2e', fg='white', font=('Consolas', 10),
+                           yscrollcommand=scrollbar.set)
+        self.text.pack(fill='both', expand=True)
+        scrollbar.config(command=self.text.yview)
+        
+        # Botoes
+        btn_frame = tk.Frame(self, bg='#2d2d2d')
+        btn_frame.pack(fill='x', pady=10)
+        
+        ttk.Button(btn_frame, text="Atualizar", command=self.refresh).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="Limpar Log", command=self.clear_log).pack(side='left', padx=10)
+        ttk.Button(btn_frame, text="Fechar", command=self.destroy).pack(side='right', padx=10)
+        
+        self.refresh()
+    
+    def refresh(self):
+        self.text.delete('1.0', tk.END)
+        for entry in reversed(self.avcit.command_log):
+            status = "OK" if entry['success'] else "FALHA"
+            color_tag = 'success' if entry['success'] else 'error'
+            line = f"[{entry['timestamp']}] {entry['target']} - {entry['command'].strip()}\n"
+            line += f"  Status: {status} | Resposta: {entry['response']}\n\n"
+            self.text.insert('end', line)
+        
+        self.text.tag_configure('success', foreground='#00ff00')
+        self.text.tag_configure('error', foreground='#ff0000')
+    
+    def clear_log(self):
+        self.avcit.command_log.clear()
+        self.refresh()
 
 
 class DraggableSource(tk.Frame):
@@ -557,7 +797,7 @@ class MonitorWidget(tk.Frame):
         if self.decoder.crop:
             c = self.decoder.crop
             crop_info = f"({c['x']}, {c['y']}) - {c['width']}x{c['height']}"
-        info = f"Decoder: {self.decoder.name}\nIP: {self.decoder.ip}\nPorta: {self.decoder.port}\nPosicao: {self.decoder.position}\nStatus: {self.decoder.status}\nFonte: {self.decoder.current_source or 'Nenhuma'}\nRecorte: {crop_info}"
+        info = f"Decoder: {self.decoder.name}\nIP: {self.decoder.ip}\nPorta TCP: {self.decoder.port}\nPorta HTTP: {self.decoder.http_port}\nPosicao: {self.decoder.position}\nStatus: {self.decoder.status}\nFonte: {self.decoder.current_source or 'Nenhuma'}\nRecorte: {crop_info}"
         messagebox.showinfo("Propriedades do Monitor", info)
     
     def identify(self):
@@ -672,7 +912,7 @@ class VideoWallController:
         self.grid_rows = 4
         self.grid_cols = 14
         
-        self.init_sample_data()
+        self.init_devices()
         self.build_ui()
         self.load_config()
         
@@ -690,34 +930,50 @@ class VideoWallController:
         style.configure('TLabelframe', background='#1a1a2e', foreground='white')
         style.configure('TLabelframe.Label', background='#1a1a2e', foreground='white')
     
-    def init_sample_data(self):
+    def init_devices(self):
+        """Inicializa encoders e decoders com IPs reais do arquivo .tp"""
+        
         # ============================================================
-        # CONFIGURACAO DOS ENCODERS (FONTES DE VIDEO)
-        # IPs: 172.16.207.75 ate 172.16.207.86 (12 encoders)
+        # ENCODERS (FONTES DE VIDEO) - Extraidos do arquivo CICCN_NOC.tp
         # ============================================================
         encoder_config = [
-            ("enc_00", "Mesa-01", "172.16.207.75"),
-            ("enc_01", "Mesa-02", "172.16.207.76"),
-            ("enc_02", "Mesa-03", "172.16.207.77"),
-            ("enc_03", "Mesa-04", "172.16.207.78"),
-            ("enc_04", "Mesa-05", "172.16.207.79"),
-            ("enc_05", "Mesa-06", "172.16.207.80"),
-            ("enc_06", "Mesa-07", "172.16.207.81"),
-            ("enc_07", "Mesa-08", "172.16.207.82"),
-            ("enc_08", "Mesa-09", "172.16.207.83"),
-            ("enc_09", "Mesa_Reuniao", "172.16.207.84"),
-            ("enc_10", "Biamp_Noc", "172.16.207.85"),
-            ("enc_11", "Crise", "172.16.207.86"),
+            ("enc_01", "Mesa-01", "172.16.207.75"),
+            ("enc_02", "Mesa-02", "172.16.207.76"),
+            ("enc_03", "Mesa-03", "172.16.207.77"),
+            ("enc_04", "Mesa-03.1", "172.16.207.78"),
+            ("enc_05", "Mesa-04", "172.16.207.79"),
+            ("enc_06", "Mesa-04.1", "172.16.207.80"),
+            ("enc_07", "Mesa-05", "172.16.207.81"),
+            ("enc_08", "Mesa-06", "172.16.207.82"),
+            ("enc_09", "Mesa-07", "172.16.207.83"),
+            ("enc_10", "Mesa-08", "172.16.207.84"),
+            ("enc_11", "Mesa-09", "172.16.207.85"),
+            ("enc_12", "Mesa_Reuniao", "172.16.207.86"),
+            ("enc_13", "Biamp_Noc_1", "172.16.207.87"),
+            ("enc_14", "Biamp_Noc_2", "172.16.207.88"),
+            ("enc_15", "Crise_AP_01", "172.16.207.89"),
+            ("enc_16", "Crise_AP_02", "172.16.207.90"),
+            ("enc_17", "Crise_AP_03", "172.16.207.91"),
+            ("enc_18", "Crise_Biamp", "172.16.207.92"),
         ]
         
         for enc_id, name, ip in encoder_config:
-            encoder = Encoder(id=enc_id, name=name, ip=ip, port=5000, status="offline", width=1920, height=1080)
+            encoder = Encoder(
+                id=enc_id, 
+                name=name, 
+                ip=ip, 
+                port=5000,
+                rtsp_port=554,
+                rtsp_port_preview=2554,
+                status="offline", 
+                width=1920, 
+                height=1080
+            )
             self.encoders[encoder.id] = encoder
         
         # ============================================================
-        # CONFIGURACAO DOS DECODERS (MONITORES)
-        # IPs: 172.16.207.11 ate 172.16.207.66 (56 decoders)
-        # Layout: 4 linhas x 14 colunas
+        # DECODERS (MONITORES) - IPs 172.16.207.11 ate 172.16.207.66
+        # Layout: 4 linhas x 14 colunas = 56 monitores
         # ============================================================
         decoder_ip_start = 11
         for row in range(self.grid_rows):
@@ -728,7 +984,8 @@ class VideoWallController:
                     id=f"dec_{idx:02d}", 
                     name=f"M{idx:02d}", 
                     ip=f"172.16.207.{ip_suffix}", 
-                    port=5000, 
+                    port=5000,
+                    http_port=80,
                     position=(row, col), 
                     status="offline"
                 )
@@ -811,10 +1068,18 @@ class VideoWallController:
         
         ttk.Separator(controls_frame, orient='horizontal').pack(fill='x', pady=5)
         
+        ttk.Button(controls_frame, text="Ver Log de Comandos", command=self.show_command_log).pack(fill='x', padx=5, pady=2)
+        
+        ttk.Separator(controls_frame, orient='horizontal').pack(fill='x', pady=5)
+        
         tk.Label(controls_frame, text="Modo de exibicao:", bg='#2d2d2d', fg='white', font=('Segoe UI', 9)).pack(anchor='w', padx=5)
         self.display_mode = tk.StringVar(value="4x14")
         for text, mode in [("4 x 14 (56 monitores)", "4x14"), ("2 x 14 (28 monitores)", "2x14"), ("4 x 7 (28 monitores)", "4x7")]:
             ttk.Radiobutton(controls_frame, text=text, variable=self.display_mode, value=mode, command=self.change_display_mode).pack(anchor='w', padx=10)
+    
+    def show_command_log(self):
+        """Abre janela de log de comandos"""
+        CommandLogDialog(self.root, self.avcit)
     
     def build_videowall_panel(self, parent):
         wall_frame = tk.LabelFrame(parent, text="Video Wall (4 x 14 = 56 monitores) - Duplo clique para configurar recorte", bg='#1a1a2e', fg='white', font=('Segoe UI', 10, 'bold'))
@@ -856,8 +1121,8 @@ class VideoWallController:
         self.drag_window.overrideredirect(True)
         self.drag_window.attributes('-alpha', 0.8)
         self.drag_window.attributes('-topmost', True)
-        tk.Label(self.drag_window, text=f"{encoder.name}", bg='#4a9eff', fg='white', font=('Segoe UI', 10, 'bold'), padx=10, pady=5).pack()
-        self.info_label.configure(text=f"Arrastando: {encoder.name}")
+        tk.Label(self.drag_window, text=f"{encoder.name}\n{encoder.ip}", bg='#4a9eff', fg='white', font=('Segoe UI', 10, 'bold'), padx=10, pady=5).pack()
+        self.info_label.configure(text=f"Arrastando: {encoder.name} ({encoder.ip})")
     
     def drag_motion(self, x, y):
         if self.drag_window:
@@ -887,7 +1152,7 @@ class VideoWallController:
         threading.Thread(target=self._send_switch_command, args=(monitor.decoder, encoder), daemon=True).start()
     
     def _send_switch_command(self, decoder, encoder):
-        self.avcit.switch_source(decoder.ip, decoder.port, encoder.ip, encoder.port)
+        success = self.avcit.switch_source(decoder.ip, decoder.port, encoder.ip, encoder.port)
         if decoder.crop and decoder.crop.get('enabled'):
             crop = CropRegion.from_dict(decoder.crop)
             self.avcit.set_crop(decoder.ip, decoder.port, crop)
@@ -962,7 +1227,7 @@ class VideoWallController:
         
         source_dialog = tk.Toplevel(self.root)
         source_dialog.title("Selecionar Fonte para Matriz")
-        source_dialog.geometry("300x400")
+        source_dialog.geometry("350x450")
         source_dialog.configure(bg='#2d2d2d')
         source_dialog.transient(self.root)
         source_dialog.grab_set()
@@ -1094,12 +1359,16 @@ class VideoWallController:
     
     def _refresh_status_thread(self):
         for encoder in self.encoders.values():
-            encoder.status = 'online' if self.avcit.ping_device(encoder.ip, encoder.port) else 'offline'
+            status = self.avcit.check_device_status(encoder.ip, encoder.port, 80)
+            encoder.status = status
             self.root.after(0, lambda e=encoder: self.source_widgets[e.id].update_status(e.status))
+        
         for decoder in self.decoders.values():
-            decoder.status = 'online' if self.avcit.ping_device(decoder.ip, decoder.port) else 'offline'
+            status = self.avcit.check_device_status(decoder.ip, decoder.port, decoder.http_port)
+            decoder.status = status
             if decoder.id in self.monitor_widgets:
                 self.root.after(0, lambda d=decoder: self.monitor_widgets[d.id].update_status(d.status))
+        
         self.root.after(0, lambda: self.info_label.configure(text="Status atualizado"))
     
     def monitor_devices(self):
