@@ -691,19 +691,47 @@ class VideoWallController:
         style.configure('TLabelframe.Label', background='#1a1a2e', foreground='white')
     
     def init_sample_data(self):
-        source_names = ["Mesa-01", "Mesa-02", "Mesa-03", "Mesa-03.1", "Mesa-04", "Mesa-04.1",
-                        "Mesa-05", "Mesa-06", "Mesa-07", "Mesa-08", "Mesa-09", "Mesa_Reuniao",
-                        "Biamp_Noc_1", "Biamp_Noc_2", "Crise_AP_01", "Crise_AP_02",
-                        "Crise_AP_03", "Crise_Biamp", "Bancada_01", "Bancada_02", "Bancada_03"]
+        # ============================================================
+        # CONFIGURACAO DOS ENCODERS (FONTES DE VIDEO)
+        # IPs: 172.16.207.75 ate 172.16.207.86 (12 encoders)
+        # ============================================================
+        encoder_config = [
+            ("enc_00", "Mesa-01", "172.16.207.75"),
+            ("enc_01", "Mesa-02", "172.16.207.76"),
+            ("enc_02", "Mesa-03", "172.16.207.77"),
+            ("enc_03", "Mesa-04", "172.16.207.78"),
+            ("enc_04", "Mesa-05", "172.16.207.79"),
+            ("enc_05", "Mesa-06", "172.16.207.80"),
+            ("enc_06", "Mesa-07", "172.16.207.81"),
+            ("enc_07", "Mesa-08", "172.16.207.82"),
+            ("enc_08", "Mesa-09", "172.16.207.83"),
+            ("enc_09", "Mesa_Reuniao", "172.16.207.84"),
+            ("enc_10", "Biamp_Noc", "172.16.207.85"),
+            ("enc_11", "Crise", "172.16.207.86"),
+        ]
         
-        for i, name in enumerate(source_names):
-            encoder = Encoder(id=f"enc_{i:02d}", name=name, ip=f"192.168.1.{100 + i}", port=5000, status="offline", width=1920, height=1080)
+        for enc_id, name, ip in encoder_config:
+            encoder = Encoder(id=enc_id, name=name, ip=ip, port=5000, status="offline", width=1920, height=1080)
             self.encoders[encoder.id] = encoder
         
+        # ============================================================
+        # CONFIGURACAO DOS DECODERS (MONITORES)
+        # IPs: 172.16.207.11 ate 172.16.207.66 (56 decoders)
+        # Layout: 4 linhas x 14 colunas
+        # ============================================================
+        decoder_ip_start = 11
         for row in range(self.grid_rows):
             for col in range(self.grid_cols):
                 idx = row * self.grid_cols + col + 1
-                decoder = Decoder(id=f"dec_{idx:02d}", name=f"M{idx:02d}", ip=f"192.168.2.{idx}", port=5000, position=(row, col), status="offline")
+                ip_suffix = decoder_ip_start + (idx - 1)
+                decoder = Decoder(
+                    id=f"dec_{idx:02d}", 
+                    name=f"M{idx:02d}", 
+                    ip=f"172.16.207.{ip_suffix}", 
+                    port=5000, 
+                    position=(row, col), 
+                    status="offline"
+                )
                 self.decoders[decoder.id] = decoder
     
     def build_ui(self):
