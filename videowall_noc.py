@@ -3,7 +3,7 @@
 """
 Sistema de Gerenciamento de Video Wall - SALA NOC
 Ministerio da Justica e Seguranca Publica
-Versao com suporte a RTSP e Crop Visual
+Versao com Telnet para AVCIT
 """
 
 import tkinter as tk
@@ -12,13 +12,12 @@ import json
 import socket
 import threading
 import time
+import telnetlib
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 import os
 from datetime import datetime
 import sys
-import urllib.request
-import urllib.error
 
 if sys.platform == 'win32':
     try:
@@ -59,8 +58,8 @@ class Encoder:
     id: str
     name: str
     ip: str
-    port: int = 5000
-    rtsp_port: int = 554
+    port: int = 22
+    rtsp_port: int = 551
     rtsp_port_preview: int = 2554
     description: str = ""
     status: str = "offline"
@@ -73,7 +72,7 @@ class Encoder:
         elif resolution == "preview":
             return f"rtsp://{self.ip}:2554/352"
         else:
-            return f"rtsp://{self.ip}:554/1080"
+            return f"rtsp://{self.ip}:551/2160"
     
     def to_dict(self):
         return asdict(self)
@@ -88,8 +87,7 @@ class Decoder:
     id: str
     name: str
     ip: str
-    port: int = 5000
-    http_port: int = 80
+    port: int = 23  # Telnet port
     position: Tuple[int, int] = (0, 0)
     current_source: Optional[str] = None
     status: str = "offline"
@@ -156,9 +154,9 @@ class Preset:
 
 
 class AVCITController:
-    """Controlador de comunicacao com dispositivos AVCIT"""
+    """Controlador de comunicacao com dispositivos AVCIT via Telnet"""
     
-    def __init__(self, timeout: float = 2.0):
+    def __init__(self, timeout: float = 3.0):
         self.timeout = timeout
         self.command_log = []
     
@@ -174,163 +172,291 @@ class AVCITController:
         if len(self.command_log) > 100:
             self.command_log.pop(0)
     
-    def send_tcp_command(self, ip: str, port: int, command: str):
-        """Envia comando via TCP"""
+    def send_telnet_command(self, ip: str, port: int, command: str, wait_for_prompt: bool = True):
+        """Envia comando via Telnet"""
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout)
-                sock.connect((ip, port))
-                sock.sendall(command.encode('utf-8'))
-                response = sock.recv(4096).decode('utf-8')
-                self.log_command(ip, command, True, response)
-                return response
+            tn = telnetlib.Telnet(ip, port, timeout=self.timeout)
+            time.sleep(0.3)  # Aguarda prompt inicial
+            
+            # Tenta ler prompt inicial
+            try:
+                initial = tn.read_very_eager().decode('utf-8', errors='ignore')
+            except:
+                initial = ""
+            
+            # Envia comando
+            tn.write((command + "\r\n").encode('utf-8'))
+            time.sleep(0.5)  # Aguarda resposta
+            
+            # Le resposta
+            try:
+                response = tn.read_very_eager().decode('utf-8', errors='ignore')
+            except:
+                response = ""
+            
+            tn.close()
+            
+            full_response = initial + response
+            self.log_command(ip, command, True, full_response.strip()[:200])
+            return full_response
+            
         except Exception as e:
             self.log_command(ip, command, False, str(e))
             return None
     
-    def send_http_command(self, ip: str, port: int, endpoint: str, params: dict = None):
-        """Envia comando via HTTP REST API"""
+    def send_raw_socket(self, ip: str, port: int, command: str):
+        """Envia comando via socket raw"""
         try:
-            url = f"http://{ip}:{port}{endpoint}"
-            if params:
-                param_str = "&".join([f"{k}={v}" for k, v in params.items()])
-                url = f"{url}?{param_str}"
-            
-            req = urllib.request.Request(url, method='GET')
-            req.add_header('User-Agent', 'VideoWall-NOC/1.0')
-            
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                result = response.read().decode('utf-8')
-                self.log_command(ip, f"HTTP:{endpoint}", True, result)
-                return result
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.timeout)
+                sock.connect((ip, port))
+                sock.sendall((command + "\r\n").encode('utf-8'))
+                time.sleep(0.3)
+                response = sock.recv(4096).decode('utf-8', errors='ignore')
+                self.log_command(ip, f"RAW:{command}", True, response.strip()[:200])
+                return response
         except Exception as e:
-            self.log_command(ip, f"HTTP:{endpoint}", False, str(e))
+            self.log_command(ip, f"RAW:{command}", False, str(e))
             return None
     
-    def switch_source_tcp(self, decoder_ip, decoder_port, encoder_ip, encoder_port):
-        """Troca fonte via TCP - Protocolo AVCIT padrao"""
-        # Tenta varios formatos de comando conhecidos
+    def discover_commands(self, decoder_ip: str, port: int = 23):
+        """Tenta descobrir comandos disponiveis via Telnet"""
+        results = []
+        
+        # Lista de comandos comuns para descoberta
+        discovery_commands = [
+            "help",
+            "?",
+            "list",
+            "status",
+            "info",
+            "version",
+            "get status",
+            "show",
+        ]
+        
+        for cmd in discovery_commands:
+            response = self.send_telnet_command(decoder_ip, port, cmd)
+            if response and len(response.strip()) > 5:
+                results.append((cmd, response.strip()[:500]))
+        
+        return results
+    
+    def switch_source_telnet(self, decoder_ip: str, decoder_port: int, encoder_ip: str):
+        """Troca fonte via Telnet - tenta varios formatos de comando"""
+        
+        # Lista de comandos para tentar (formatos comuns AVCIT)
         commands = [
-            f"SWITCH:{encoder_ip}:{encoder_port}\r\n",
-            f"switch {encoder_ip} {encoder_port}\r\n",
-            f"SET SOURCE {encoder_ip}\r\n",
-            f"ROUTE {encoder_ip} TO {decoder_ip}\r\n",
+            f"switch {encoder_ip}",
+            f"SWITCH {encoder_ip}",
+            f"set source {encoder_ip}",
+            f"SET SOURCE {encoder_ip}",
+            f"source {encoder_ip}",
+            f"SOURCE {encoder_ip}",
+            f"connect {encoder_ip}",
+            f"CONNECT {encoder_ip}",
+            f"play rtsp://{encoder_ip}:551/2160",
+            f"PLAY rtsp://{encoder_ip}:551/2160",
+            f"url rtsp://{encoder_ip}:551/2160",
+            f"stream {encoder_ip}",
+            f"input {encoder_ip}",
+            f"route {encoder_ip}",
+            f"join {encoder_ip}",
+            f"link {encoder_ip}",
+            f"video {encoder_ip}",
+            f"av {encoder_ip}",
         ]
         
         for cmd in commands:
-            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
-            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
-                return True
-        return False
+            response = self.send_telnet_command(decoder_ip, decoder_port, cmd)
+            if response:
+                response_upper = response.upper()
+                # Verifica se teve sucesso
+                if any(word in response_upper for word in ["OK", "SUCCESS", "DONE", "ACCEPTED", "CONNECTED"]):
+                    return True, cmd, response
+                # Verifica se NAO teve erro explicito
+                if not any(word in response_upper for word in ["ERROR", "FAIL", "INVALID", "UNKNOWN", "DENIED"]):
+                    # Pode ter funcionado silenciosamente
+                    pass
+        
+        return False, None, "Nenhum comando funcionou"
     
-    def switch_source_http(self, decoder_ip, http_port, encoder_ip):
-        """Troca fonte via HTTP API"""
-        # Tenta varios endpoints conhecidos de dispositivos AVCIT
-        endpoints = [
-            ("/api/switch", {"source": encoder_ip}),
-            ("/cgi-bin/switch.cgi", {"ip": encoder_ip}),
-            ("/control/switch", {"encoder": encoder_ip}),
-            ("/api/v1/source", {"address": encoder_ip}),
+    def set_crop_telnet(self, decoder_ip: str, decoder_port: int, crop):
+        """Configura crop via Telnet"""
+        
+        commands = [
+            f"crop {crop.x} {crop.y} {crop.width} {crop.height}",
+            f"CROP {crop.x} {crop.y} {crop.width} {crop.height}",
+            f"window {crop.x} {crop.y} {crop.width} {crop.height}",
+            f"WINDOW {crop.x} {crop.y} {crop.width} {crop.height}",
+            f"set crop {crop.x},{crop.y},{crop.width},{crop.height}",
+            f"set window {crop.x},{crop.y},{crop.width},{crop.height}",
+            f"region {crop.x} {crop.y} {crop.width} {crop.height}",
+            f"zoom {crop.x} {crop.y} {crop.width} {crop.height}",
         ]
         
-        for endpoint, params in endpoints:
-            response = self.send_http_command(decoder_ip, http_port, endpoint, params)
-            if response and ("ok" in response.lower() or "success" in response.lower()):
+        for cmd in commands:
+            response = self.send_telnet_command(decoder_ip, decoder_port, cmd)
+            if response:
+                response_upper = response.upper()
+                if any(word in response_upper for word in ["OK", "SUCCESS", "DONE"]):
+                    return True, cmd, response
+        
+        return False, None, "Nenhum comando de crop funcionou"
+    
+    def clear_crop_telnet(self, decoder_ip: str, decoder_port: int):
+        """Limpa crop via Telnet"""
+        commands = [
+            "crop reset",
+            "CROP RESET",
+            "crop 0 0 1920 1080",
+            "window reset",
+            "zoom reset",
+            "fullscreen",
+        ]
+        
+        for cmd in commands:
+            response = self.send_telnet_command(decoder_ip, decoder_port, cmd)
+            if response and "OK" in response.upper():
                 return True
         return False
     
     def switch_source(self, decoder_ip, decoder_port, encoder_ip, encoder_port):
-        """Tenta trocar fonte usando TCP e HTTP"""
-        # Primeiro tenta TCP
-        if self.switch_source_tcp(decoder_ip, decoder_port, encoder_ip, encoder_port):
-            return True
-        # Se falhar, tenta HTTP
-        return self.switch_source_http(decoder_ip, 80, encoder_ip)
-    
-    def set_crop_tcp(self, decoder_ip, decoder_port, crop):
-        """Configura crop via TCP"""
-        commands = [
-            f"CROP:{crop.x}:{crop.y}:{crop.width}:{crop.height}\r\n",
-            f"SET CROP {crop.x} {crop.y} {crop.width} {crop.height}\r\n",
-            f"WINDOW {crop.x},{crop.y},{crop.width},{crop.height}\r\n",
-        ]
-        
-        for cmd in commands:
-            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
-            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
-                return True
-        return False
-    
-    def set_crop_http(self, decoder_ip, http_port, crop):
-        """Configura crop via HTTP API"""
-        params = {
-            "x": crop.x,
-            "y": crop.y,
-            "width": crop.width,
-            "height": crop.height
-        }
-        
-        endpoints = [
-            "/api/crop",
-            "/cgi-bin/crop.cgi",
-            "/control/window",
-            "/api/v1/crop",
-        ]
-        
-        for endpoint in endpoints:
-            response = self.send_http_command(decoder_ip, http_port, endpoint, params)
-            if response and ("ok" in response.lower() or "success" in response.lower()):
-                return True
-        return False
+        """Metodo principal para trocar fonte"""
+        success, cmd, response = self.switch_source_telnet(decoder_ip, decoder_port, encoder_ip)
+        return success
     
     def set_crop(self, decoder_ip, decoder_port, crop):
-        """Tenta configurar crop usando TCP e HTTP"""
-        if self.set_crop_tcp(decoder_ip, decoder_port, crop):
-            return True
-        return self.set_crop_http(decoder_ip, 80, crop)
+        """Metodo principal para configurar crop"""
+        success, cmd, response = self.set_crop_telnet(decoder_ip, decoder_port, crop)
+        return success
     
     def clear_crop(self, decoder_ip, decoder_port):
-        """Limpa configuracao de crop"""
-        commands = [
-            "CROP:CLEAR\r\n",
-            "CROP:0:0:1920:1080\r\n",
-            "SET CROP FULL\r\n",
-        ]
-        
-        for cmd in commands:
-            response = self.send_tcp_command(decoder_ip, decoder_port, cmd)
-            if response and ("OK" in response.upper() or "SUCCESS" in response.upper()):
-                return True
-        return False
+        """Metodo principal para limpar crop"""
+        return self.clear_crop_telnet(decoder_ip, decoder_port)
     
     def ping_device(self, ip, port):
-        """Verifica se dispositivo esta online"""
+        """Verifica se dispositivo esta online via TCP"""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1.0)
                 result = sock.connect_ex((ip, port))
                 return result == 0
-        except Exception:
-            return False
-    
-    def ping_http(self, ip, port=80):
-        """Verifica se dispositivo responde HTTP"""
-        try:
-            url = f"http://{ip}:{port}/"
-            req = urllib.request.Request(url, method='HEAD')
-            with urllib.request.urlopen(req, timeout=1.0) as response:
-                return response.status < 500
         except:
             return False
     
-    def check_device_status(self, ip, tcp_port=5000, http_port=80):
-        """Verifica status do dispositivo via TCP e HTTP"""
-        tcp_ok = self.ping_device(ip, tcp_port)
-        http_ok = self.ping_http(ip, http_port)
+    def check_device_status(self, ip, port=23):
+        """Verifica status do dispositivo"""
+        return "online" if self.ping_device(ip, port) else "offline"
+
+
+class DiscoveryDialog(tk.Toplevel):
+    """Dialogo para descoberta de comandos do dispositivo"""
+    
+    def __init__(self, parent, avcit_controller, device_ip, device_port=23):
+        super().__init__(parent)
+        self.avcit = avcit_controller
+        self.device_ip = device_ip
+        self.device_port = device_port
         
-        if tcp_ok or http_ok:
-            return "online"
-        return "offline"
+        self.title(f"Descoberta de Comandos - {device_ip}")
+        self.geometry("700x500")
+        self.configure(bg='#2d2d2d')
+        self.transient(parent)
+        
+        # Frame principal
+        main_frame = tk.Frame(self, bg='#2d2d2d')
+        main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        tk.Label(main_frame, text=f"Testando comandos em {device_ip}:{device_port}",
+                 bg='#2d2d2d', fg='white', font=('Segoe UI', 12, 'bold')).pack(pady=5)
+        
+        # Frame para comando manual
+        cmd_frame = tk.Frame(main_frame, bg='#2d2d2d')
+        cmd_frame.pack(fill='x', pady=10)
+        
+        tk.Label(cmd_frame, text="Comando:", bg='#2d2d2d', fg='white').pack(side='left', padx=5)
+        self.cmd_entry = ttk.Entry(cmd_frame, width=50)
+        self.cmd_entry.pack(side='left', padx=5)
+        ttk.Button(cmd_frame, text="Enviar", command=self.send_manual_command).pack(side='left', padx=5)
+        
+        # Text area para resultados
+        text_frame = tk.Frame(main_frame, bg='#2d2d2d')
+        text_frame.pack(fill='both', expand=True, pady=10)
+        
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side='right', fill='y')
+        
+        self.text = tk.Text(text_frame, bg='#1a1a2e', fg='white', font=('Consolas', 10),
+                           yscrollcommand=scrollbar.set)
+        self.text.pack(fill='both', expand=True)
+        scrollbar.config(command=self.text.yview)
+        
+        # Botoes
+        btn_frame = tk.Frame(main_frame, bg='#2d2d2d')
+        btn_frame.pack(fill='x', pady=10)
+        
+        ttk.Button(btn_frame, text="Descobrir Comandos", command=self.run_discovery).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Testar Switch", command=self.test_switch).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Limpar", command=self.clear_text).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Fechar", command=self.destroy).pack(side='right', padx=5)
+        
+        self.cmd_entry.bind('<Return>', lambda e: self.send_manual_command())
+    
+    def log(self, text):
+        self.text.insert('end', text + "\n")
+        self.text.see('end')
+        self.update()
+    
+    def clear_text(self):
+        self.text.delete('1.0', tk.END)
+    
+    def send_manual_command(self):
+        cmd = self.cmd_entry.get().strip()
+        if not cmd:
+            return
+        
+        self.log(f"\n>>> Enviando: {cmd}")
+        response = self.avcit.send_telnet_command(self.device_ip, self.device_port, cmd)
+        if response:
+            self.log(f"<<< Resposta:\n{response}")
+        else:
+            self.log("<<< Sem resposta ou erro de conexao")
+        
+        self.cmd_entry.delete(0, tk.END)
+    
+    def run_discovery(self):
+        self.log("\n" + "="*50)
+        self.log("INICIANDO DESCOBERTA DE COMANDOS...")
+        self.log("="*50)
+        
+        results = self.avcit.discover_commands(self.device_ip, self.device_port)
+        
+        if results:
+            for cmd, response in results:
+                self.log(f"\n>>> {cmd}")
+                self.log(f"<<< {response[:300]}")
+        else:
+            self.log("Nenhum comando retornou resposta util")
+    
+    def test_switch(self):
+        self.log("\n" + "="*50)
+        self.log("TESTANDO COMANDOS DE SWITCH...")
+        self.log("="*50)
+        
+        # Usa um encoder de teste
+        test_encoder = "172.16.207.75"
+        
+        success, cmd, response = self.avcit.switch_source_telnet(
+            self.device_ip, self.device_port, test_encoder
+        )
+        
+        if success:
+            self.log(f"\nSUCESSO! Comando que funcionou: {cmd}")
+            self.log(f"Resposta: {response}")
+        else:
+            self.log(f"\nNenhum comando funcionou automaticamente")
+            self.log("Verifique o log de comandos para detalhes")
 
 
 class CropSelectorDialog(tk.Toplevel):
@@ -366,7 +492,6 @@ class CropSelectorDialog(tk.Toplevel):
         main_frame = tk.Frame(self, bg='#2d2d2d')
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Info da fonte
         info_frame = tk.Frame(main_frame, bg='#2d2d2d')
         info_frame.pack(fill='x', pady=5)
         
@@ -380,7 +505,6 @@ class CropSelectorDialog(tk.Toplevel):
         tk.Label(main_frame, text="Clique e arraste para selecionar a regiao de recorte",
                  bg='#2d2d2d', fg='#888888', font=('Segoe UI', 10)).pack(pady=2)
         
-        # Canvas para selecao visual
         canvas_frame = tk.Frame(main_frame, bg='#1a1a2e', relief='solid', bd=2)
         canvas_frame.pack(pady=10)
         
@@ -395,7 +519,6 @@ class CropSelectorDialog(tk.Toplevel):
         self.canvas.bind('<B1-Motion>', self.on_mouse_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_mouse_up)
         
-        # Controles numericos
         controls_frame = tk.Frame(main_frame, bg='#2d2d2d')
         controls_frame.pack(fill='x', pady=10)
         
@@ -420,7 +543,6 @@ class CropSelectorDialog(tk.Toplevel):
         
         ttk.Button(input_frame, text="Aplicar Valores", command=self.update_selection_from_values).grid(row=0, column=8, padx=10)
         
-        # Presets de recorte
         presets_frame = tk.LabelFrame(controls_frame, text="Presets de Recorte", bg='#2d2d2d', fg='white')
         presets_frame.pack(fill='x', pady=10, padx=20)
         
@@ -439,12 +561,10 @@ class CropSelectorDialog(tk.Toplevel):
         for i, (text, command) in enumerate(preset_buttons):
             ttk.Button(presets_inner, text=text, command=command, width=16).grid(row=i//4, column=i%4, padx=3, pady=3)
         
-        # Info da selecao
         self.info_label = tk.Label(main_frame, text="Nenhuma regiao selecionada",
                                    bg='#2d2d2d', fg='#4a9eff', font=('Segoe UI', 10))
         self.info_label.pack(pady=5)
         
-        # Botoes de acao
         btn_frame = tk.Frame(main_frame, bg='#2d2d2d')
         btn_frame.pack(pady=10)
         
@@ -453,7 +573,6 @@ class CropSelectorDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Cancelar", command=self.destroy).pack(side='left', padx=5)
     
     def draw_grid(self):
-        # Grade de referencia
         for i in range(1, 4):
             x = i * self.display_width // 4
             self.canvas.create_line(x, 0, x, self.display_height, fill='#333333', dash=(2, 4))
@@ -461,7 +580,6 @@ class CropSelectorDialog(tk.Toplevel):
             y = i * self.display_height // 4
             self.canvas.create_line(0, y, self.display_width, y, fill='#333333', dash=(2, 4))
         
-        # Linhas centrais
         cx = self.display_width // 2
         self.canvas.create_line(cx, 0, cx, self.display_height, fill='#444444', width=1)
         cy = self.display_height // 2
@@ -622,11 +740,10 @@ class CommandLogDialog(tk.Toplevel):
         self.avcit = avcit_controller
         
         self.title("Log de Comandos AVCIT")
-        self.geometry("800x500")
+        self.geometry("900x600")
         self.configure(bg='#2d2d2d')
         self.transient(parent)
         
-        # Text area com scroll
         text_frame = tk.Frame(self, bg='#2d2d2d')
         text_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
@@ -638,7 +755,6 @@ class CommandLogDialog(tk.Toplevel):
         self.text.pack(fill='both', expand=True)
         scrollbar.config(command=self.text.yview)
         
-        # Botoes
         btn_frame = tk.Frame(self, bg='#2d2d2d')
         btn_frame.pack(fill='x', pady=10)
         
@@ -652,13 +768,9 @@ class CommandLogDialog(tk.Toplevel):
         self.text.delete('1.0', tk.END)
         for entry in reversed(self.avcit.command_log):
             status = "OK" if entry['success'] else "FALHA"
-            color_tag = 'success' if entry['success'] else 'error'
             line = f"[{entry['timestamp']}] {entry['target']} - {entry['command'].strip()}\n"
             line += f"  Status: {status} | Resposta: {entry['response']}\n\n"
             self.text.insert('end', line)
-        
-        self.text.tag_configure('success', foreground='#00ff00')
-        self.text.tag_configure('error', foreground='#ff0000')
     
     def clear_log(self):
         self.avcit.command_log.clear()
@@ -764,6 +876,7 @@ class MonitorWidget(tk.Frame):
         menu.add_command(label="Limpar fonte", command=self.clear_source)
         menu.add_command(label="Propriedades", command=self.show_properties)
         menu.add_separator()
+        menu.add_command(label="Descobrir Comandos", command=self.open_discovery)
         menu.add_command(label="Identificar", command=self.identify)
         menu.tk_popup(event.x_root, event.y_root)
     
@@ -781,6 +894,10 @@ class MonitorWidget(tk.Frame):
         else:
             messagebox.showwarning("Aviso", "Selecione uma fonte primeiro")
     
+    def open_discovery(self):
+        """Abre janela de descoberta de comandos"""
+        DiscoveryDialog(self.controller.root, self.controller.avcit, self.decoder.ip, self.decoder.port)
+    
     def clear_crop(self):
         self.decoder.set_crop_region(None)
         self.has_crop = False
@@ -797,7 +914,7 @@ class MonitorWidget(tk.Frame):
         if self.decoder.crop:
             c = self.decoder.crop
             crop_info = f"({c['x']}, {c['y']}) - {c['width']}x{c['height']}"
-        info = f"Decoder: {self.decoder.name}\nIP: {self.decoder.ip}\nPorta TCP: {self.decoder.port}\nPorta HTTP: {self.decoder.http_port}\nPosicao: {self.decoder.position}\nStatus: {self.decoder.status}\nFonte: {self.decoder.current_source or 'Nenhuma'}\nRecorte: {crop_info}"
+        info = f"Decoder: {self.decoder.name}\nIP: {self.decoder.ip}\nPorta Telnet: {self.decoder.port}\nPosicao: {self.decoder.position}\nStatus: {self.decoder.status}\nFonte: {self.decoder.current_source or 'Nenhuma'}\nRecorte: {crop_info}"
         messagebox.showinfo("Propriedades do Monitor", info)
     
     def identify(self):
@@ -931,11 +1048,9 @@ class VideoWallController:
         style.configure('TLabelframe.Label', background='#1a1a2e', foreground='white')
     
     def init_devices(self):
-        """Inicializa encoders e decoders com IPs reais do arquivo .tp"""
+        """Inicializa encoders e decoders com configuracoes reais"""
         
-        # ============================================================
-        # ENCODERS (FONTES DE VIDEO) - Extraidos do arquivo CICCN_NOC.tp
-        # ============================================================
+        # ENCODERS (FONTES) - Porta SSH 22, RTSP 551/2554
         encoder_config = [
             ("enc_01", "Mesa-01", "172.16.207.75"),
             ("enc_02", "Mesa-02", "172.16.207.76"),
@@ -959,22 +1074,13 @@ class VideoWallController:
         
         for enc_id, name, ip in encoder_config:
             encoder = Encoder(
-                id=enc_id, 
-                name=name, 
-                ip=ip, 
-                port=5000,
-                rtsp_port=554,
-                rtsp_port_preview=2554,
-                status="offline", 
-                width=1920, 
-                height=1080
+                id=enc_id, name=name, ip=ip, 
+                port=22, rtsp_port=551, rtsp_port_preview=2554,
+                status="offline", width=1920, height=1080
             )
             self.encoders[encoder.id] = encoder
         
-        # ============================================================
-        # DECODERS (MONITORES) - IPs 172.16.207.11 ate 172.16.207.66
-        # Layout: 4 linhas x 14 colunas = 56 monitores
-        # ============================================================
+        # DECODERS (MONITORES) - Porta Telnet 23
         decoder_ip_start = 11
         for row in range(self.grid_rows):
             for col in range(self.grid_cols):
@@ -984,8 +1090,7 @@ class VideoWallController:
                     id=f"dec_{idx:02d}", 
                     name=f"M{idx:02d}", 
                     ip=f"172.16.207.{ip_suffix}", 
-                    port=5000,
-                    http_port=80,
+                    port=23,  # TELNET
                     position=(row, col), 
                     status="offline"
                 )
@@ -1019,7 +1124,7 @@ class VideoWallController:
         left_frame.pack(side='left', padx=20)
         tk.Label(left_frame, text="MINISTERIO DA JUSTICA E SEGURANCA PUBLICA", bg='#0d1b2a', fg='#4a9eff', font=('Segoe UI', 10, 'bold')).pack(side='left')
         
-        tk.Label(header, text="SALA NOC - Sistema de Video Wall", bg='#0d1b2a', fg='white', font=('Segoe UI', 16, 'bold')).pack(expand=True)
+        tk.Label(header, text="SALA NOC - Sistema de Video Wall (Telnet)", bg='#0d1b2a', fg='white', font=('Segoe UI', 16, 'bold')).pack(expand=True)
         
         right_frame = tk.Frame(header, bg='#0d1b2a')
         right_frame.pack(side='right', padx=20)
@@ -1069,6 +1174,7 @@ class VideoWallController:
         ttk.Separator(controls_frame, orient='horizontal').pack(fill='x', pady=5)
         
         ttk.Button(controls_frame, text="Ver Log de Comandos", command=self.show_command_log).pack(fill='x', padx=5, pady=2)
+        ttk.Button(controls_frame, text="Descobrir Comandos", command=self.open_discovery_first_decoder).pack(fill='x', padx=5, pady=2)
         
         ttk.Separator(controls_frame, orient='horizontal').pack(fill='x', pady=5)
         
@@ -1078,11 +1184,15 @@ class VideoWallController:
             ttk.Radiobutton(controls_frame, text=text, variable=self.display_mode, value=mode, command=self.change_display_mode).pack(anchor='w', padx=10)
     
     def show_command_log(self):
-        """Abre janela de log de comandos"""
         CommandLogDialog(self.root, self.avcit)
     
+    def open_discovery_first_decoder(self):
+        """Abre descoberta para o primeiro decoder"""
+        first_decoder = list(self.decoders.values())[0]
+        DiscoveryDialog(self.root, self.avcit, first_decoder.ip, first_decoder.port)
+    
     def build_videowall_panel(self, parent):
-        wall_frame = tk.LabelFrame(parent, text="Video Wall (4 x 14 = 56 monitores) - Duplo clique para configurar recorte", bg='#1a1a2e', fg='white', font=('Segoe UI', 10, 'bold'))
+        wall_frame = tk.LabelFrame(parent, text="Video Wall (4 x 14 = 56 monitores) - Clique direito para opcoes", bg='#1a1a2e', fg='white', font=('Segoe UI', 10, 'bold'))
         wall_frame.pack(fill='both', expand=True)
         self.wall_container = wall_frame
         
@@ -1110,9 +1220,9 @@ class VideoWallController:
     def build_bottom_panel(self):
         bottom = tk.Frame(self.root, bg='#0d1b2a', height=30)
         bottom.pack(fill='x', side='bottom')
-        self.info_label = tk.Label(bottom, text="Arraste uma fonte para os monitores | Duplo clique para configurar recorte | Ctrl+Click para selecao multipla", bg='#0d1b2a', fg='#888888', font=('Segoe UI', 9))
+        self.info_label = tk.Label(bottom, text="Arraste fonte para monitor | Duplo clique = Recorte | Clique direito = Descobrir comandos", bg='#0d1b2a', fg='#888888', font=('Segoe UI', 9))
         self.info_label.pack(side='left', padx=20, pady=5)
-        self.counter_label = tk.Label(bottom, text=f"Monitores: {len(self.decoders)} | Fontes: {len(self.encoders)}", bg='#0d1b2a', fg='#888888', font=('Segoe UI', 9))
+        self.counter_label = tk.Label(bottom, text=f"Monitores: {len(self.decoders)} | Fontes: {len(self.encoders)} | Porta: Telnet 23", bg='#0d1b2a', fg='#888888', font=('Segoe UI', 9))
         self.counter_label.pack(side='right', padx=20, pady=5)
     
     def start_drag(self, encoder):
@@ -1145,14 +1255,14 @@ class VideoWallController:
             else:
                 self.apply_source_to_monitor(target_widget, self.dragging_encoder)
         self.dragging_encoder = None
-        self.info_label.configure(text="Arraste uma fonte para os monitores | Duplo clique para configurar recorte")
+        self.info_label.configure(text="Arraste fonte para monitor | Duplo clique = Recorte | Clique direito = Descobrir comandos")
     
     def apply_source_to_monitor(self, monitor, encoder):
         monitor.set_source(encoder)
         threading.Thread(target=self._send_switch_command, args=(monitor.decoder, encoder), daemon=True).start()
     
     def _send_switch_command(self, decoder, encoder):
-        success = self.avcit.switch_source(decoder.ip, decoder.port, encoder.ip, encoder.port)
+        self.avcit.switch_source(decoder.ip, decoder.port, encoder.ip, encoder.port)
         if decoder.crop and decoder.crop.get('enabled'):
             crop = CropRegion.from_dict(decoder.crop)
             self.avcit.set_crop(decoder.ip, decoder.port, crop)
@@ -1165,7 +1275,7 @@ class VideoWallController:
             monitor.set_selected(True)
             self.selected_monitors.append(monitor)
         count = len(self.selected_monitors)
-        self.info_label.configure(text=f"{count} monitor(es) selecionado(s)" if count > 0 else "Arraste uma fonte para os monitores | Duplo clique para configurar recorte")
+        self.info_label.configure(text=f"{count} monitor(es) selecionado(s)" if count > 0 else "Arraste fonte para monitor | Duplo clique = Recorte | Clique direito = Descobrir comandos")
     
     def clear_selection(self):
         for monitor in self.selected_monitors:
@@ -1354,22 +1464,22 @@ class VideoWallController:
             self.matrices.clear()
     
     def refresh_status(self):
-        self.info_label.configure(text="Atualizando status dos dispositivos...")
+        self.info_label.configure(text="Atualizando status dos dispositivos (porta Telnet 23)...")
         threading.Thread(target=self._refresh_status_thread, daemon=True).start()
     
     def _refresh_status_thread(self):
         for encoder in self.encoders.values():
-            status = self.avcit.check_device_status(encoder.ip, encoder.port, 80)
+            status = self.avcit.check_device_status(encoder.ip, encoder.port)
             encoder.status = status
             self.root.after(0, lambda e=encoder: self.source_widgets[e.id].update_status(e.status))
         
         for decoder in self.decoders.values():
-            status = self.avcit.check_device_status(decoder.ip, decoder.port, decoder.http_port)
+            status = self.avcit.check_device_status(decoder.ip, decoder.port)
             decoder.status = status
             if decoder.id in self.monitor_widgets:
                 self.root.after(0, lambda d=decoder: self.monitor_widgets[d.id].update_status(d.status))
         
-        self.root.after(0, lambda: self.info_label.configure(text="Status atualizado"))
+        self.root.after(0, lambda: self.info_label.configure(text="Status atualizado (Telnet 23)"))
     
     def monitor_devices(self):
         while self.monitoring:
