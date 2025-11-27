@@ -795,7 +795,7 @@ class VideoWallController:
         header = tk.Frame(self.root, bg='#0d1b2a', height=50)
         header.pack(fill='x')
         header.pack_propagate(False)
-        tk.Label(header, text="MJSP - SALA NOC", bg='#0d1b2a', fg='#4a9eff', font=('Segoe UI', 10, 'bold')).pack(side='left', padx=20)
+        tk.Label(header, text="MJSP - SALA NOC-Desenvolvido pelo Engenheiro Eletricista Daniel Paz", bg='#0d1b2a', fg='#4a9eff', font=('Segoe UI', 10, 'bold')).pack(side='left', padx=20)
         tk.Label(header, text="Sistema de Video Wall", bg='#0d1b2a', fg='white', font=('Segoe UI', 14, 'bold')).pack(expand=True)
         self.status_lbl = tk.Label(header, text="* Online", bg='#0d1b2a', fg='#00ff00', font=('Segoe UI', 10))
         self.status_lbl.pack(side='right', padx=20)
